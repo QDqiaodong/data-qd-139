@@ -1,0 +1,15 @@
+{
+  "bits": 64,
+  "hashes": 3,
+  "items": [
+    "alpha",
+    "beta",
+    "alpha",
+    "gamma"
+  ],
+  "queries": [
+    "alpha",
+    "delta",
+    "beta"
+  ]
+}

@@ -51,3 +51,63 @@
 ## 资源与错误
 
 生产路径流式读取清单，去重与归属差集在库内（临时表）完成；不把完整清单或全库item放入Python集合/列表。库中100万个不同item、单次替换100万行时，进程峰值RSS不超过128MiB（测量方法见README）。除SQLite事务故障所需文件（-wal/-shm）外，不遗留临时中间产物。输入/状态错误退出2且无部分变更。库与输入/输出的路径冲突、数据库符号链接在写入前拒绝。
+
+# 可核验快照与隔离恢复 v3（snapshot / snapshot-check / restore）
+
+把单个**已提交**数据库状态打包为自描述、可离线核验、可恢复到隔离分析节点的快照包（bundle）。仅用标准库与SQLite；新增命令不改变 init/sync/query 与v1入口的任何输出和行为，输入或状态错误一律退出2。
+
+## 包格式（format_version=1）
+
+bundle 是一个目录，且**只能**包含两个普通文件（多、少、符号链接、子目录均拒绝）：
+
+- `index.sqlite3`：单一文件的一致性SQLite快照，journal_mode=DELETE（rollback journal），不含 -wal/-shm 侧车；
+- `manifest.json`：严格JSON（拒绝重复键、非有限数值），字段集合精确为且类型必须为：
+  - `format_version`：整数，当前固定 1；
+  - `bits`、`hashes`：整数，沿用 1..1000000 与 1..16 边界；
+  - `commit_seq`：非负整数，快照所固定的已提交状态序号；
+  - `db_size_bytes`：正整数，包内 `index.sqlite3` 的精确字节数；
+  - `db_sha256`：64个小写十六进制字符，包内 `index.sqlite3` 原始字节的SHA256。
+
+缺失字段、额外字段、错误类型（如字符串型bits、浮点hashes）、未知format_version、非法摘要均直接拒绝，不做部分修复。清单中的每个字段都必须描述包内同一个数据库快照，不允许拼接复制前后的状态。
+
+## snapshot —— 只读导出
+
+`bloom-index snapshot --db 库路径 --output 新目录`：
+
+- 目标目录已存在（含悬空符号链接、同名文件）、其父目录是符号链接或路径冲突时拒绝；导出全程不写源库。
+- 以 `mode=ro` 只读打开WAL源库，在一个只读事务内固定一个已提交状态，并从该同一状态读出 bits、hashes、commit_seq、active_items、来源代次与位计数；随后用SQLite在线备份API把该事务所见状态复制到同目录隐藏暂存区。导出期间另一个进程的 `sync` 可以正常提交：读者不等待写事务结束，备份也不持有写锁，因此不会因长时间写锁使 sync 失败；若 sync 在备份期间提交，包仍完整对应导出开始时固定的那一个提交状态。
+- 复制后在暂存库上 checkpoint（TRUNCATE）并切换为 DELETE 日志，执行 `PRAGMA integrity_check`、结构核对，并重新读出全部元信息与固定状态逐项比对，不一致即放弃整包；然后计算字节数与SHA256写入清单，最后以目录原子改名发布。
+- 只读连接可能在源目录产生空的 -wal/-shm；导出结束时仅清理**本次连接新建**且当前没有活动写事务（WAL为空）的侧车，任何预先存在或已被写者采用的侧车都不触碰。
+
+## snapshot-check —— 只读核验
+
+`bloom-index snapshot-check --bundle 目录`，成功打印含 `status:"ok"` 的摘要，任何缺陷退出2。全程以 `immutable=1` 只读打开包内数据库，绝不创建侧车或修改任何字节（重复核验前后包内文件SHA256不变）。核验顺序与内容：
+
+1. 目录与条目契约：真实目录、无符号链接、恰为两个普通文件；
+2. 清单严格解析：字段集合、类型、边界、摘要格式；
+3. `index.sqlite3` 字节数等于 `db_size_bytes`、SHA256等于 `db_sha256`；
+4. `PRAGMA integrity_check` 返回 ok，数据库对象与v2模式完全一致且日志模式为 delete；
+5. 库内关系（单一只读事务内）：
+   - `meta` 恰含 bits/hashes/commit_seq/active_items 四个非负整数，bits/hashes 在界内；
+   - 每个 source 的当前代次与 `generations` 凭据一一对应，代次从1连续无缺口，且每行 `base_generation = generation - 1`，sha256为合法摘要；
+   - commit_seq 与代次历史相容（不低于最高来源代次，不高于已应用代次总数）；
+   - `active_items` 等于 ownership 中不同 item 数，ownership 不引用未知来源，无重复 (source,item)；
+   - 按 ownership 的不同 item 用 `filtering.positions` 重新推导每个位置的计数器，与 `counters` 表逐行相等（位置在界内、计数为正、无缺失无多余）；
+6. 清单的 bits、hashes、commit_seq 与库内读出值逐一相等。
+
+错误信息带表名/来源/位置等定位线索；发现任何损坏即拒绝，不生成部分修复。
+
+## restore —— 暂存发布
+
+`bloom-index restore --bundle 目录 --db 新库路径`：
+
+- 发布条件完全由**包内数据库与清单的实际核验结果**决定：先完整运行 snapshot-check 等价核验；例如清单 commit_seq 与库内不一致时直接拒绝，绝不会从源库另读元数据放行，目标路径保持不存在。
+- 目标路径及其 -wal/-shm 侧车已存在（含符号链接）即拒绝，已有目标字节保持不变；不覆盖现有数据库，不回写源包。
+- 在目标**同目录**的隐藏暂存目录中流式复制包内数据库，重新计算大小/摘要并做完整性与全量关系校验；全部写入和校验成功后，才用原子改名发布，发布后再读回确认状态未变。
+- 任一步失败：删除本次暂存目录，既有目标（若有）原样保留，目标路径不会半创建。故障排除后可对同一路径重试。
+- 全程不跟随符号链接；暂存名不含可逃逸目录的相对段，发布改名不会越过目标父目录；对包的读取保持只读。
+
+## 成功语义
+
+恢复出的新库可直接被现有 `query` 审计；对同一查询输入，其报告与导出时源库报告在 commit_seq、bits、hashes、active_items、set_bits、bitmap_hex 及逐查询 maybe_present/actual_present/source_count 上逐项相同，来源数与活跃集合一致。
+

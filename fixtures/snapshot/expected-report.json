@@ -1,0 +1,69 @@
+{
+  "active_items": 6,
+  "bitmap_hex": "8040000000002000400804608002024200018000040000000111840220000000",
+  "bits": 256,
+  "commit_seq": 2,
+  "false_negatives": 0,
+  "false_positives": 0,
+  "hashes": 4,
+  "negative_queries": 3,
+  "observed_false_positive_rate": "0",
+  "queries": [
+    {
+      "actual_present": false,
+      "item": "alpha",
+      "maybe_present": false,
+      "source_count": 0
+    },
+    {
+      "actual_present": true,
+      "item": "beta",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": true,
+      "item": "gamma",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": true,
+      "item": "delta",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": true,
+      "item": "epsilon",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": false,
+      "item": "zeta",
+      "maybe_present": false,
+      "source_count": 0
+    },
+    {
+      "actual_present": true,
+      "item": "eta",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": true,
+      "item": "theta",
+      "maybe_present": true,
+      "source_count": 1
+    },
+    {
+      "actual_present": false,
+      "item": "absent-one",
+      "maybe_present": false,
+      "source_count": 0
+    }
+  ],
+  "schema_version": 2,
+  "set_bits": 23
+}

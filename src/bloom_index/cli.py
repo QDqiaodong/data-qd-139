@@ -3,7 +3,7 @@ import argparse, json, sqlite3, sys
 from pathlib import Path
 from .common import read, save
 from .model import analyze
-from . import store
+from . import snapshot, store
 
 def run(source):
     data,digest=read(source)
@@ -47,7 +47,36 @@ def query(argv):
     report=store.query_db(args.db,args.source);save(args.output,report)
     print(json.dumps(report,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
 
-COMMANDS={'init':init,'sync':sync,'query':query}
+def snapshot_export(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index snapshot',description='Export one committed database state as a verifiable bundle')
+    parser.add_argument('--db',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args(argv)
+    summary=snapshot.export_snapshot(args.db,args.output)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
+def snapshot_check(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index snapshot-check',description='Verify a snapshot bundle read-only; exit 2 on any defect')
+    parser.add_argument('--bundle',type=Path,required=True)
+    args=parser.parse_args(argv)
+    verified=snapshot.verify_bundle(args.bundle)
+    state=verified['state'];manifest=verified['manifest']
+    summary={'status':'ok','format_version':manifest['format_version'],'commit_seq':state['commit_seq'],
+             'bits':state['bits'],'hashes':state['hashes'],'active_items':state['active_items'],
+             'sources':state['sources'],'db_size_bytes':verified['db_size_bytes'],
+             'db_sha256':verified['db_sha256']}
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
+def restore(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index restore',description='Restore a verified bundle to a new database path')
+    parser.add_argument('--bundle',type=Path,required=True)
+    parser.add_argument('--db',type=Path,required=True)
+    args=parser.parse_args(argv)
+    summary=snapshot.restore_bundle(args.bundle,args.db)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
+COMMANDS={'init':init,'sync':sync,'query':query,
+          'snapshot':snapshot_export,'snapshot-check':snapshot_check,'restore':restore}
 
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)

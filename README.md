@@ -44,6 +44,29 @@ bloom-index query --db run/idx.db --source fixtures/index/query.json --output ru
 
 清单为UTF-8 JSONL，每行严格 `{"item":"标识符"}`（<=4096字节、<=100万行）；sha256绑定实际读到的原始字节。计数索引表示所有来源有效item的并集：每item对其不同哈希位置各贡献1次，仅在全局来源数跨越0与1边界时调整，归零才清位。并发上允许一个写者加多个读者（WAL）；第二写者5秒内拿不到写锁退出2，读者不等待写事务结束。写事务中途被终止后重开，只见完整旧态或完整新态。完整语义见 [数据契约](docs/contract.md)。
 
+## 可核验快照与隔离恢复（v3）
+
+把单个已提交数据库状态导出为自描述快照包，离线核验后恢复到隔离分析节点；导出只读、不阻塞并发 sync，恢复采用同目录暂存+原子发布：
+
+```sh
+bloom-index snapshot --db run/idx.db --output run/bundle        # 导出：index.sqlite3 + manifest.json
+bloom-index snapshot-check --bundle run/bundle                  # 只读全量核验，失败退出2
+bloom-index restore --bundle run/bundle --db run/analytic.db    # 仅核验完整通过才发布到新路径
+bloom-index query --db run/analytic.db --source fixtures/index/query.json --output run/audit.json
+```
+
+- `snapshot`：在只读事务内固定一个已提交状态，用SQLite在线备份复制，清单记录 format_version、bits、hashes、commit_seq、数据库字节数与SHA256，全部字段与包内同一快照交叉核对；目标目录已存在、路径冲突或符号链接一律拒绝，不改源库。
+- `snapshot-check`：严格拒绝缺失/额外/错误类型字段，校验文件大小、摘要、`integrity_check`、日志模式、清单与库内元信息一致，并核对来源代次凭据连续、commit_seq/active_items 关系及重算的位置计数器；只读且不改包内字节，损坏给可定位错误、不做部分修复。
+- `restore`：只接受完整通过检查的包，恢复到不存在的新路径；同目录暂存、全部写入和校验成功后原子改名，任何失败都保留既有目标并清除暂存，修正后可重试；不跟随符号链接、不接受路径穿越、不覆盖现有数据库、不旁路改写源包。
+
+`fixtures/snapshot/` 下的自制 SQLite 快照夹具（含 `fixture-bundle/`、查询输入与期望报告/核验摘要）由真实CLI确定性生成，重建方式：
+
+```sh
+PYTHONPATH=src python3 -I tools/build_snapshot_fixture.py fixtures/snapshot
+```
+
+完整包格式、核验项与故障语义见 [数据契约](docs/contract.md) 的 v3 章节。
+
 ## 规模测量
 
 流式读取清单、库内去重与差集，峰值内存有界。可重复的测量方法（默认100万item建库+100万行替换，上限128MiB，失败退出1）：
@@ -65,3 +88,7 @@ bloom-index query --db run/idx.db --source fixtures/index/query.json --output ru
 # Persistent membership routing index v2
 
 多上游清单的持久成员路由：init建库固定bits/hashes；sync按代次凭据原子替换各来源归属并维护并集计数位图；query在单一已提交快照输出精确+Bloom审计。代次重放无副作用，错误整批拒绝，崩溃只见完整旧/新态。流式清单处理，100万item规模下峰值RSS<=128MiB。
+
+# Verifiable snapshot export and restore v3
+
+snapshot把单个已提交WAL状态只读备份为单文件DELETE日志库加严格manifest（format_version/bits/hashes/commit_seq/字节数/SHA256）；snapshot-check只读核验摘要、完整性、代次凭据连续性、active_items与重算计数器；restore在目标同目录暂存并在校验全过后原子发布，失败不留暂存、不改既有目标。

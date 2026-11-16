@@ -27,6 +27,34 @@ python3 -m venv .venv
 src/bloom_index/model.py 为业务模型，相关算法模块独立组织；common.py 提供受限JSON及报告发布，
 cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采用MIT许可。
 
+## 持久成员路由索引（v2）
+
+在单次审计之外，`bloom-index` 提供多上游数据清单的持久成员路由索引，仅用标准库与SQLite：
+
+```sh
+bloom-index init --db run/idx.db --bits 1000000 --hashes 16     # 建空库，参数永久固定
+bloom-index sync --db run/idx.db --source fixtures/index/control_gen1.json
+bloom-index sync --db run/idx.db --source fixtures/index/control_gen2.json
+bloom-index query --db run/idx.db --source fixtures/index/query.json --output run/audit.json
+```
+
+- `init`：创建空库；路径已存在即拒绝（退出2），不损伤已有库。
+- `sync`：按控制文件把各来源的完整归属替换为对应代清单；整批一个事务，含新代时 commit_seq 加1；完全相同的已应用代是无副作用重放；任何行错误、摘要不符、跳代或同代异内容都整批拒绝且无部分变更。
+- `query`：在一个已提交快照中同时读归属与计数位图，输出 schema_version=2 审计报告（含 commit_seq、active_items、set_bits、bitmap_hex、逐查询 item/maybe_present/actual_present/source_count 及误报统计）。
+
+清单为UTF-8 JSONL，每行严格 `{"item":"标识符"}`（<=4096字节、<=100万行）；sha256绑定实际读到的原始字节。计数索引表示所有来源有效item的并集：每item对其不同哈希位置各贡献1次，仅在全局来源数跨越0与1边界时调整，归零才清位。并发上允许一个写者加多个读者（WAL）；第二写者5秒内拿不到写锁退出2，读者不等待写事务结束。写事务中途被终止后重开，只见完整旧态或完整新态。完整语义见 [数据契约](docs/contract.md)。
+
+## 规模测量
+
+流式读取清单、库内去重与差集，峰值内存有界。可重复的测量方法（默认100万item建库+100万行替换，上限128MiB，失败退出1）：
+
+```sh
+.venv/bin/python tools/measure_scale.py                      # 完整规模
+.venv/bin/python tools/measure_scale.py --items 20000 --lines 20000   # 快速冒烟
+```
+
+输出JSON含各阶段耗时、子进程峰值RSS（ru_maxrss）与一致性核对；`--keep` 保留工作目录便于检查。
+
 ## 当前业务与样例
 # Deterministic Bloom audit v1
 
@@ -34,3 +62,6 @@ cli.py 衔接数据链路。fixtures 为明确自制样例，代码与样例采�
 第i个位置=SHA256(十进制i的ASCII + 一个零字节 + UTF8 item)大端整数 mod bits，i从0起。位图hex按字节，小端位索引；多余尾位为0。输出精确独立数、置位数、每查询maybe_present/actual_present、误报次数与负例分母，分母0时误报率null；假阴性必须0。
 理论近似误报率(1-exp(-kn/m))^k只作理想均匀独立哈希近似，不能代替实测；小位图或相关哈希不保证吻合。为可核验基线保留精确集合做审计，因此不是声称端到端常数空间；过滤阳性不能视作已存在，不能用于删除原始数据。当前不做可删除Bloom、增量落盘或跨进程并发。
 
+# Persistent membership routing index v2
+
+多上游清单的持久成员路由：init建库固定bits/hashes；sync按代次凭据原子替换各来源归属并维护并集计数位图；query在单一已提交快照输出精确+Bloom审计。代次重放无副作用，错误整批拒绝，崩溃只见完整旧/新态。流式清单处理，100万item规模下峰值RSS<=128MiB。

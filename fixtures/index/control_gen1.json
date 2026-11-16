@@ -1,0 +1,1 @@
+{"updates":[{"source":"供应方甲","generation":1,"base_generation":0,"manifest":"supplier_a_gen1.jsonl","sha256":"825d06b9dd34d65773b23a69c495c12291ec98cb8211343b6781e8abcd10c782"},{"source":"供应方乙","generation":1,"base_generation":0,"manifest":"supplier_b_gen1.jsonl","sha256":"9e08a34c22f1892e3399cf7a569a4f7122b5052daf6dfd3864de5c8cf5080e7e"}]}

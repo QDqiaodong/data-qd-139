@@ -1,4 +1,5 @@
 """Strict local JSON contract and atomic report publication."""
+from contextlib import contextmanager
 from pathlib import Path
 import hashlib, json, os, tempfile
 
@@ -41,3 +42,31 @@ def save(path,report):
         os.replace(temp,dest)
     finally:
         if temp and os.path.exists(temp):os.unlink(temp)
+
+def _jsonl_line(obj):
+    return json.dumps(obj,sort_keys=True,ensure_ascii=False,allow_nan=False,separators=(',',':'))+'\n'
+
+@contextmanager
+def jsonl_sink(path):
+    """Stream a JSONL report to a hidden sibling file and atomically replace on success.
+
+    Rows are UTF-8 with sorted keys and compact separators, one line each. Any
+    exception inside the ``with`` block (including injected write failures)
+    discards the temporary file and leaves an existing destination byte-for-byte
+    unchanged; a symlinked destination is refused before any write.
+    """
+    dest=Path(path)
+    if dest.is_symlink():raise ValueError('output cannot be a symlink')
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    handle=tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',newline='\n',
+                                       dir=dest.parent,delete=False)
+    temp=handle.name
+    try:
+        def emit(obj):handle.write(_jsonl_line(obj))
+        yield emit
+        handle.flush();os.fsync(handle.fileno());handle.close()
+        os.replace(temp,dest)
+    except BaseException:
+        if not handle.closed:handle.close()
+        if os.path.exists(temp):os.unlink(temp)
+        raise

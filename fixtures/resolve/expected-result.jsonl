@@ -1,0 +1,7 @@
+{"active":8,"commit_seq":1,"entities":6,"inactive":1,"total":9,"type":"summary"}
+{"anchor":"L","blocked_with":{"entity":"b","kind":"anchor","value":["L","R"]},"entity":"a","members":[{"rid":"a","source":"A"},{"rid":"c","source":"C"},{"rid":"d","source":"D"}],"type":"entity"}
+{"anchor":"R","blocked_with":{"entity":"a","kind":"anchor","value":["L","R"]},"entity":"b","members":[{"rid":"b","source":"B"}],"type":"entity"}
+{"anchor":"K1","blocked_with":{"entity":"e2","kind":"anchor","value":["K1","K2"]},"entity":"e1","members":[{"rid":"e1","source":"B"}],"type":"entity"}
+{"anchor":"K2","blocked_with":{"entity":"e1","kind":"anchor","value":["K1","K2"]},"entity":"e2","members":[{"rid":"e2","source":"D"}],"type":"entity"}
+{"anchor":null,"blocked_with":{"entity":"s2","kind":"source","value":"A"},"entity":"s1","members":[{"rid":"s1","source":"A"}],"type":"entity"}
+{"anchor":null,"blocked_with":{"entity":"s1","kind":"source","value":"A"},"entity":"s2","members":[{"rid":"s2","source":"A"}],"type":"entity"}

@@ -1,0 +1,4 @@
+{"rid": "a", "source": "A", "anchor": "L", "aliases": ["x"]}
+{"rid": "b", "source": "B", "anchor": "R", "aliases": ["y"]}
+{"rid": "s1", "source": "A", "anchor": null, "aliases": ["shared"]}
+{"rid": "e1", "source": "B", "anchor": "K1", "aliases": ["k"]}

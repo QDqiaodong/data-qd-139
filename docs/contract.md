@@ -111,3 +111,77 @@ bundle 是一个目录，且**只能**包含两个普通文件（多、少、符
 
 恢复出的新库可直接被现有 `query` 审计；对同一查询输入，其报告与导出时源库报告在 commit_seq、bits、hashes、active_items、set_bits、bitmap_hex 及逐查询 maybe_present/actual_present/source_count 上逐项相同，来源数与活跃集合一致。
 
+# 供应方主数据记录归并 v4（resolve）
+
+把供应方主数据中的别名记录归并为可消费的实体组。`bloom-index resolve --db 成员索引 --source 控制文件.json --output 结果.jsonl`，仅用Python标准库与SQLite；新增命令不改变 init/sync/query/snapshot 等既有入口、成员索引模式与快照包格式，输入或状态错误一律退出2。
+
+## 控制文件与JSONL行契约
+
+控制文件为严格JSON（拒绝重复键、非有限数值、坏UTF-8），字段**恰为** `files`：1..64个互不相同的JSONL文件路径（按文本与解析后的真实路径双重去重），相对路径相对控制文件所在目录解析；输入文件缺失即拒绝。
+
+每个JSONL文件为UTF-8、每行一个JSON对象，行字段**恰为** `rid`、`source`、`anchor`、`aliases`（拒绝重复字段、未知字段、空行、坏UTF-8、非有限数值、非JSON行）：
+
+- `rid`、`source` 沿用v1 ident规则（非空、去空白后不变、<=128字符、无控制字符）；
+- `anchor` 为 null 或一个 ident；
+- `aliases` 为1..8个字符串。别名先按 ident 校验，再做 Unicode NFKC 规范化后 `casefold()` 并再次按 ident 校验；记录内规范化后相同的别名折叠为一个；
+- 每行最多16384字节（不含换行）；整批最多1000000条记录；`rid` 跨文件唯一，重复即整批拒绝，错误信息包含文件与行号（第二处出现位置）。
+
+空输入文件允许（0条记录）；空批（全部文件为空）仍正常产出摘要行。
+
+## 目录选取——单一已提交读快照
+
+`--db` 指向既有成员索引。在读取**第一条主数据之前**，以 `mode=ro` 只读连接并在一个只读事务（`BEGIN`）中固定一个已提交读快照，从该同一快照取得 `commit_seq`、`bits`、`hashes`；此后整个运行不再从live库另读任何版本或归属。每条记录的精确 `(source, rid)` 存在于该快照的 `ownership` 表才计为 active，否则 inactive。不得用只核 item 的 `source_count` 或Bloom阳性替代精确归属判定。
+
+所有行先完成完整校验：inactive 记录不掩盖坏行，也不掩盖跨文件重复 rid。只有 active 记录参与候选生成、实体归并与冲突证据；inactive 记录不出现在任何实体的 members 中。被 sync 清空的身份不参与，恢复归属后的新运行重新参与；成员库全程只读（`PRAGMA query_only`），不创建表、不持有写锁，工作表写入独立磁盘工作区。
+
+## 候选调度——Bloom预过滤加精确核实
+
+两个**当前实体组**只要共享一个规范别名即互为候选，组ID取组内最小 rid；所有排序采用 UTF-8 字节序（SQLite BINARY/TEXT 主键序）。
+
+- 接入流式聚合时即增量维护“至少出现在两条记录中的别名”表（`repeat_alias`，别名前导索引驱动，不做全量 GROUP BY 排序，也不在 Python 持有别名集合）；位图仅对这一 repeat 集合按 `filtering.positions` 的同一哈希契约置位（位图大小与哈希数取自快照的 bits/hashes），因此每个被查询的 repeat 别名都不会出现假阴性，单条记录独有的别名不参与哈希、也不需要精确查找；
+- 调度时逐别名先过 Bloom：Bloom 阴性直接跳过精确别名查找（观测统计 `bloom_negative_lookups`），Bloom 阳性必须经 `alias_group` 精确核实——因此 bits=1/hashes=16 等极端碰撞下，不同别名的假阳性也不会形成候选；
+- 同一组对经多个别名到达只算一个候选（主键去重 + 最小组ID选取）；重复别名不重复影响结果。
+
+## 受约束的贪心归并
+
+初始每条 active 记录各为一组，组状态为：成员集合、来源集合（组内每个 source 至多一条记录）、至多一种非 null anchor、规范别名并集。反复执行：在当前候选中选择同时满足两项约束、且组ID对字典序最小的一对合并，直到不存在可合并候选：
+
+1. 两组合并后每个 source 至多一条记录（同源记录即使共享 anchor 也不能合并）；
+2. 非 null anchor 至多一种（null 不与任何 anchor 冲突；两个不同的非 null anchor 必须隔离；不同来源、相同 anchor 可以合并）。
+
+共享别名本身不是强制合并；不能先求连通分量再任意拆分。每次合并产生的新组ID（取较小者）、别名并集、来源集合与 anchor 状态都反馈回候选调度，下一轮排序与可合并性判断基于合并后的当前组状态，而非按原始 rid 排好的一次性边序列。
+
+## 结果JSONL与冲突证据
+
+输出为UTF-8 JSONL，紧凑分隔（无多余空格）、JSON键排序、每行一个 `\n`；同一快照下文件排列与行序变化不得改变输出字节。第一行：
+
+```json
+{"type":"summary","commit_seq":S,"total":N,"active":A,"inactive":I,"entities":G}
+```
+
+其后按组ID排序，每行一个实体：
+
+```json
+{"type":"entity","entity":ID,"members":[{"rid":...,"source":...}],"anchor":值或null,"blocked_with":证据或null}
+```
+
+- members 按 rid 排序；每个 active rid 恰出现一次，inactive 不出现，`total = active + inactive`；
+- `blocked_with`：在与本组共享别名的其他**最终组**中取ID最小者；不存在则 null。否则 `{"entity":对方ID,"kind":"anchor"或"source","value":证据}`：双方 anchor 均非空且不同时优先 anchor，value 为按字节序排序的两个 anchor；否则为 source，value 为双方共有 source 中字节序最小者；
+- 空批或全部 inactive 时仍输出摘要行（entities=0）与固定 commit_seq；孤立组证据为 null。
+
+## 有界性与可复现测量
+
+生产接入、候选维护与输出均流式/库内完成：不把全量记录、全部别名、候选记录对或完整结果装入Python容器；不预先物化高频别名下的全部原始记录对。磁盘工作区是输出同目录下的隐藏临时SQLite库（独立于成员库，不修改其模式），所有工作表行数对记录数与别名数为线性。100万记录、每条8别名时峰值RSS<=128MiB。可复现测量：
+
+```sh
+PYTHONPATH=src python3 -I tools/measure_resolve_scale.py                          # 全量100万规模
+PYTHONPATH=src python3 -I tools/measure_resolve_scale.py --mode star --records 30000
+```
+
+star 工作负载为3万条不同 source、null anchor、共享同一别名：必须归成一个组，而朴素原始记录对约为 n(n-1)/2 ≈ 4.5亿；测量输出的 `max_workspace_table_rows` 与 `pair_table_materialized` 给出可核查观测（最大工作表仅O(n)行、无任何O(n²)对表），`peak_kib` 为子进程 ru_maxrss。
+
+## 发布、故障与路径契约
+
+`common.jsonl_sink` 把JSONL流式写入输出同目录的隐藏临时文件，完整接入与归并成功后才原子替换目标；失败保留旧输出字节并清理本次磁盘工作区，修正后可重试。输出拒绝符号链接，且不得与成员库、控制文件或任一输入文件重合（按真实路径判定）；成员库符号链接拒绝。注入式故障钩子 `BLOOM_INDEX_RESOLVE_FAIL_WORK`、`BLOOM_INDEX_RESOLVE_FAIL_OUTPUT` 仅用于测试故障语义。
+
+

@@ -1,9 +1,9 @@
 DESCRIPTION='Deterministic bounded Bloom membership with exact audit evidence'
-import argparse, json, sqlite3, sys
+import argparse, json, os, sqlite3, sys
 from pathlib import Path
 from .common import read, save
 from .model import analyze
-from . import snapshot, store
+from . import resolve as resolve_mod, snapshot, store
 
 def run(source):
     data,digest=read(source)
@@ -75,8 +75,22 @@ def restore(argv):
     summary=snapshot.restore_bundle(args.bundle,args.db)
     print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
 
+def resolve(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index resolve',
+        description='Merge supplier master alias records into constrained entity groups on one pinned snapshot')
+    parser.add_argument('--db',type=Path,required=True)
+    parser.add_argument('--source',type=Path,required=True,help='strict control JSON with a files list')
+    parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args(argv)
+    stats_path=os.environ.get('BLOOM_INDEX_RESOLVE_STATS') or None
+    stats=resolve_mod.resolve(args.db,args.source,args.output,stats_path)
+    summary={'commit_seq':stats['commit_seq'],'total':stats['total'],'active':stats['active'],
+             'inactive':stats['inactive'],'entities':stats['entities']}
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
 COMMANDS={'init':init,'sync':sync,'query':query,
-          'snapshot':snapshot_export,'snapshot-check':snapshot_check,'restore':restore}
+          'snapshot':snapshot_export,'snapshot-check':snapshot_check,'restore':restore,
+          'resolve':resolve}
 
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)

@@ -127,3 +127,34 @@ snapshot把单个已提交WAL状态只读备份为单文件DELETE日志库加严
 # Constrained supplier record resolution v4
 
 resolve在读取首条主数据前固定成员库的只读已提交快照，按精确(source,rid)归属划分active/inactive；规范别名（ident后NFKC+casefold）经Bloom预过滤与精确核实生成组候选，按每source至多一条、非null anchor至多一种的约束做字典序最小贪心合并，合并状态实时反馈调度；流式JSONL输出实体组与blocked_with冲突证据，库内工作表保证有界内存，失败原子保留旧输出并清理工作区。
+
+## 多分区事件时间窗口汇总（v5）
+
+`window-*` 把多分区交易变更流加工成可更正、可封窗的事件时间汇总表，仅用标准库与 SQLite。`STATE` 是独立的新状态库：不读取成员数据库、不消费 resolve 的实体归并结果；既有命令、库模式与快照格式保持不变。
+
+```sh
+bloom-index window-init --state run/window.db --partitions p,q --width 10 --output run/windows.jsonl
+bloom-index window-apply  --state run/window.db --source fixtures/window/control.json
+bloom-index window-recover --state run/window.db      # 只补完被中断的报告发布
+```
+
+- `window-init`：永久绑定分区集合、窗口宽度与报告绝对路径；STATE/REPORT 已存在、其一是符号链接或两者重合即拒绝，不改动既有文件。成功创建 `epoch=0`、各分区水位 0 的空报告。
+- `window-apply`：按 CONTROL 的 `files` 顺序与文件内行序流式接入严格 JSONL（`put`/`delete`/`watermark`）。每分区 seq 从 1 连续递增，历史 seq 只有原始字节完全相同才算纯重放；eid 首次 put 永久绑定分区、rev 从 1 连续递增，delete 只接受存活事件、之后可再 put 恢复。存活事件按 `(key, floor(ts/width)*width)` 精确聚合，更正先撤销旧贡献再加入新贡献；全局水位为全部已配置分区最小值，`end<=W` 的窗口为 final，触及批开始时已 final 窗口的变更整批拒绝。整批一个事务，任何坏行都不改变状态、seq 或水位。
+- `window-recover`：无需 CONTROL 或原输入，只根据已提交状态补完未结束的发布；已发布时重复调用字节不变。`window-apply` 在接受新批前也会先做同样恢复。
+- 发布：有至少一条新 seq 时 epoch 加 1，纯重放不变；报告按 key 的 UTF-8 字节序、start 升序输出。报告在 STATE 同目录暂存后原子替换，并在状态库中确认；任一点被强制终止后，重启只运行 `window-recover` 即收敛到完整旧 epoch 或完整新 epoch。
+- 并发与失败：同一 STATE 只允许一个 apply/recover 写者（`flock` 覆盖恢复、提交与发布），第二写者 5 秒内拿不到即退出 2；输入/状态错误退出 2 并保留旧状态与旧报告；`common.jsonl_sink` 的既有清理语义不变。
+
+自制夹具由真实 CLI 生成（含纯重放）：
+
+```sh
+PYTHONPATH=src python3 -I tools/build_window_fixture.py fixtures/window
+```
+
+规模测量（100 万事件接入 + 10 万更正 + 8 分区报告输出，峰值上限 128MiB，并独立重算核对全部窗口）：
+
+```sh
+PYTHONPATH=src python3 -I tools/measure_window_scale.py
+PYTHONPATH=src python3 -I tools/measure_window_scale.py --events 20000 --corrections 2000
+```
+
+完整行契约、封窗规则、两种恢复设计对比与所选方案见 [数据契约](docs/contract.md) 的 v5 章节。

@@ -185,3 +185,92 @@ star 工作负载为3万条不同 source、null anchor、共享同一别名：�
 `common.jsonl_sink` 把JSONL流式写入输出同目录的隐藏临时文件，完整接入与归并成功后才原子替换目标；失败保留旧输出字节并清理本次磁盘工作区，修正后可重试。输出拒绝符号链接，且不得与成员库、控制文件或任一输入文件重合（按真实路径判定）；成员库符号链接拒绝。注入式故障钩子 `BLOOM_INDEX_RESOLVE_FAIL_WORK`、`BLOOM_INDEX_RESOLVE_FAIL_OUTPUT` 仅用于测试故障语义。
 
 
+# 事件时间窗口汇总 v5（window-init / window-apply / window-recover）
+
+把多分区交易变更流加工成可更正、可封窗的事件时间汇总表。`STATE` 是一个**独立的新状态库**：只由本组命令创建和读写，不读取成员索引 `--db`、不消费 resolve 的实体归并结果；既有命令、v1/v2/v3 格式与 v4 输出均不受影响。仅用 Python 标准库与 SQLite，输入或状态错误一律退出 2。
+
+## window-init —— 永久绑定
+
+`bloom-index window-init --state STATE --partitions p,q --width 10 --output REPORT.jsonl`
+
+- `--partitions`：1..64 个互不重复的 ident（沿用 v1 ident 规则：非空、去空白后不变、<=128 字符、无控制字符），逗号分隔；
+- `--width`：1..86400 的整数（窗口宽度，秒）；
+- `--output`：报告绝对路径。相对写法按当前工作目录解析为绝对路径后写入状态，之后不再受工作目录影响。
+
+初始化把分区集合、窗口宽度与报告绝对路径**永久绑定**进状态库并固定 `format_version=1`。STATE 或 REPORT 任一路径已存在（含悬空符号链接，REPORT 同时检查原样路径与解析后路径）或两者重合即拒绝且不做任何写入。成功后创建 `epoch=0`、各分区水位=0 的空报告（仅一行 summary），报告字节的 SHA256 与字节数同时记入状态。状态库在 STATE 同目录的隐藏暂存目录建成后再原子改名发布，成功不遗留暂存。
+
+## CONTROL 与行契约
+
+CONTROL 是严格 JSON（拒绝重复键、坏 UTF-8、非有限数值），字段**恰为** `files`：1..64 个互不相同的 JSONL 路径，相对路径相对 CONTROL 所在目录解析，缺失即拒绝。
+
+每个文件为 UTF-8 JSONL，各文件按 `files` 顺序、文件内按行序处理；每行至多 16384 字节（不含末尾 LF），空文件允许，整批最多 1000000 行。每行**恰为**下列之一：
+
+```json
+{"partition":P,"seq":S,"op":"put","eid":E,"rev":R,"ts":T,"key":K,"value":V}
+{"partition":P,"seq":S,"op":"delete","eid":E,"rev":R}
+{"partition":P,"seq":S,"op":"watermark","ts":T}
+```
+
+- `partition` 必须是初始化时绑定的分区；`eid`/`key` 沿用 ident 规则；
+- `seq`、`rev` 为 1..10^9 整数，`ts` 为 0..10^12 整数，`value` 为绝对值不超过 10^9 的整数；
+- 严格拒绝未知字段、重复字段、空行、坏 UTF-8、非 JSON 行、非有限数值，以及布尔或浮点形式的整数；错误信息带 `文件名:行号`。
+
+## 变更接入与身份修订
+
+- **seq 连续凭据**：每个分区第一次出现的新 seq 必须是 1，之后严格连续递增（当前最大 seq+1）。历史 seq 仅当该行的原始字节（去掉末尾 LF 后的完整行）与该分区该 seq 已接受凭据**完全相同**时跳过；否则整批拒绝。已接受 seq 的原始字节持久保存在状态库中，因此重放不会恢复旧事件，也不会改写已接受凭据。
+- **身份修订**：`eid` 全局唯一，首次 `put` 永久绑定其分区，`rev` 必须为 1；此后 `put`/`delete` 必须是该 eid 最后 `rev`+1。`delete` 只接受当前存活事件；删除后保留身份与修订凭据，之后可用下一个 `rev` 的 `put` 恢复。
+- **水位**：新 `put` 的 `ts` 不得小于该分区**批开始时**的水位；`watermark` 不得倒退。同批内的水位只在全部数据变更完成后才生效，因此同一批里先写水位再写落在该水位之下的新数据是合法的。
+
+整批在一个 SQLite 事务中完成；任何一行错误（含合法文件与坏行同批）都不改变任何 seq、身份、物化结果或水位。
+
+## 窗口物化与封窗
+
+- 存活事件按 `(key, floor(ts/width)*width)` 聚合，精确整数 `count`/`sum`。`count=0` 的行不保留；`sum=0` 且 `count>0` 的行必须保留。窗口 `end = start + width`。
+- 更正（同 eid 的新 `put`）先撤销旧贡献再加入新贡献，可同时改变 `key`、窗口与 `value`；`delete` 撤销当前贡献。
+- 全局水位 `W` 为**全部已配置分区**水位的**最小值**，从未出现数据的分区也以 0 参与。窗口 `end <= W` 时为 `final`。
+- 数据变更若触及**批开始时**已 final 的旧窗口（撤销点）或新窗口（加入点），整批拒绝。判定只看批开始时的全局水位：既不能仅检查新 `ts`，也不能因另一分区尚未追上而提前封窗。水位单调不减，因此封窗不可逆。
+
+## 报告发布与可恢复性
+
+REPORT 为 UTF-8 JSONL、JSON 键排序、紧凑分隔、每行一个 `\n`：
+
+```json
+{"type":"summary","epoch":N,"watermark":W,"partitions":{P:水位,...}}
+{"type":"window","key":K,"start":T,"end":T+width,"count":C,"sum":V,"final":true}
+```
+
+首行 summary 之后按 key 的 UTF-8 字节序、再按 start 升序输出窗口行（实现沿用 SQLite 的 BINARY 文本序）。summary 的键集合精确为 `type/epoch/watermark/partitions`，`partitions` 覆盖全部已配置分区。
+
+- 已接受的事件、seq 凭据、水位、物化结果与报告属于同一 epoch。有至少一条新 seq 时 `epoch` 只加 1；纯重放不加。
+- 报告是已提交状态的**纯函数**：同一已提交状态总能重建出相同字节。状态库内的 `epoch`/`confirmed_epoch`/`report_sha256`/`report_size` 记录“已提交 epoch”与“已发布并确认的 epoch”。
+- `window-apply` 在接受新批前先完成既有恢复；随后提交业务事务（状态库 `BEGIN IMMEDIATE`），再以“同目录隐藏暂存文件 + fsync + os.replace + 目录 fsync”发布报告，最后在状态库中确认该 epoch 已发布。
+- `window-recover --state STATE` 不需要 CONTROL 或原始输入：只要 `epoch > confirmed_epoch`（或报告缺失、字节数不符），就按已提交状态重建并确认；已确认时重复调用字节不变。
+- 报告写到一半、`os.replace` 前后、确认落库前任一时刻强制终止：旧报告保持完整，且状态库里已提交的 epoch 仍是唯一权威。重启后只运行 `window-recover` 必然收敛到“完整旧 epoch”或“完整新 epoch”，绝不会出现新 seq 配旧汇总或新报告配旧身份。若新报告已经发布，则该批已提交，恢复只会确认它，不会回退成旧态。
+
+### 两种可行的跨 SQLite 与文件系统恢复设计
+
+1. **状态库为唯一权威（采用）**：把业务提交与“报告已发布”的确认都放进 SQLite，报告由已提交状态确定性重建。正确性义务：报告必须可由状态库逐字节重建；提交后、确认前的任何中断都只能靠重建收敛；旧报告的替换必须是原子的（同目录 `os.replace`）；确认写入必须晚于 `os.replace`。恢复不需要原输入，也不会重复计数，代价是恢复时重写一遍报告。
+2. **文件系统日志/双份命名空间**：发布前把新报告写成带 epoch 的不可变文件，再用一次原子指针切换（如重命名目录或符号链接）决定“当前报告”，状态库只记录 epoch 号。正确性义务：指针切换必须原子且与状态库的 epoch 一一对应；过期指针切换必须被拒绝（需要比较 epoch，否则旧恢复会覆盖新报告）；必须保证旧 epoch 的清理不误删新 epoch 的文件。这一方案报告发布本身无需重建，但引入了额外的命名空间与“指针/状态”一致性义务，且不能像方案 1 那样用报告内容自证。
+
+所选方案 1 的另一个好处是：报告字节可由独立 oracle 从状态库重算核对，恢复逻辑没有第二处真相来源。代价是恢复会重写报告，对 100 万窗口约 90MB，仍是有界流式写出。
+
+## 单写者、路径与失败语义
+
+- 同一 STATE 只允许一个 apply/recover 写者：以 STATE 文件上的 `flock(LOCK_EX)` 取得处理权，覆盖**恢复、业务提交与文件发布**全过程；另一写者 5 秒内拿不到处理权即退出 2（SQLite 自身的忙等也保持 5 秒）。
+- 拒绝 STATE/REPORT 符号链接与彼此重合，拒绝 CONTROL 或任一输入文件与 STATE、REPORT 重合（按解析后的真实路径判定）。
+- 输入校验失败保留旧状态与旧报告（唯一例外是启动时先完成既有恢复）；正常失败会清除本次暂存文件。可恢复失败留下的隐藏暂存文件以 `.REPORT名.window-` 前缀可辨识，恢复成功后清除。
+- 原有 `common.jsonl_sink` 的语义不变：调用异常时删除临时文件并保留旧输出。新的可恢复发布协议是独立实现，不复用也不改变该语义。
+- 只承诺进程终止/重启与正常文件系统上的原子替换，不承诺机器断电或外部篡改后的恢复；外部把报告改成相同字节数的内容不在检测范围内。
+
+## 有界性与可复现测量
+
+接入、seq 凭据、身份、物化窗口与报告输出均在磁盘上流式处理，不把全量事件、凭据或报告装入 Python 容器。100 万事件接入 + 10 万更正 + 8 分区报告输出峰值 RSS 远低于 128MiB（实测约 25MiB）。可复现测量：
+
+```sh
+PYTHONPATH=src python3 -I tools/measure_window_scale.py                       # 100万事件 + 10万更正
+PYTHONPATH=src python3 -I tools/measure_window_scale.py --events 20000 --corrections 2000
+```
+
+输出含子进程峰值 RSS（ru_maxrss）、状态库各表行数、报告字节数，并用独立 SQLite 重算核对全部窗口、final 标志与 epoch。
+
+夹具 `fixtures/window/` 由真实 CLI 确定性生成（`tools/build_window_fixture.py`）：`control.json` 列两个严格变更文件，`replay.json` 只重放已接受的首个文件，`expected-report.jsonl` 为字节稳定期望报告。

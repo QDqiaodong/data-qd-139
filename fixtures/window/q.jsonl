@@ -1,0 +1,3 @@
+{"eid":"b","key":"x","op":"put","partition":"q","rev":1,"seq":1,"ts":2,"value":4}
+{"eid":"c","key":"y","op":"put","partition":"q","rev":1,"seq":2,"ts":12,"value":6}
+{"op":"watermark","partition":"q","seq":3,"ts":10}

@@ -3,7 +3,7 @@ import argparse, json, os, sqlite3, sys
 from pathlib import Path
 from .common import read, save
 from .model import analyze
-from . import resolve as resolve_mod, snapshot, store
+from . import resolve as resolve_mod, snapshot, store, window
 
 def run(source):
     data,digest=read(source)
@@ -88,9 +88,38 @@ def resolve(argv):
              'inactive':stats['inactive'],'entities':stats['entities']}
     print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
 
+def window_init(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index window-init',
+        description='Create a window state permanently bound to its partitions, width and report path')
+    parser.add_argument('--state',type=Path,required=True)
+    parser.add_argument('--partitions',type=str,required=True,help='comma separated identifiers')
+    parser.add_argument('--width',type=int,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args(argv)
+    summary=window.init_state(args.state,args.partitions,args.width,args.output)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
+def window_apply(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index window-apply',
+        description='Apply one strict change batch, then recover and publish its report')
+    parser.add_argument('--state',type=Path,required=True)
+    parser.add_argument('--source',type=Path,required=True,help='strict control JSON with a files list')
+    args=parser.parse_args(argv)
+    summary=window.apply_control(args.state,args.source)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
+def window_recover(argv):
+    parser=argparse.ArgumentParser(prog='bloom-index window-recover',
+        description='Finish any interrupted window report publication from the committed state')
+    parser.add_argument('--state',type=Path,required=True)
+    args=parser.parse_args(argv)
+    summary=window.recover_state(args.state)
+    print(json.dumps(summary,sort_keys=True,ensure_ascii=False,allow_nan=False));return 0
+
 COMMANDS={'init':init,'sync':sync,'query':query,
           'snapshot':snapshot_export,'snapshot-check':snapshot_check,'restore':restore,
-          'resolve':resolve}
+          'resolve':resolve,'window-init':window_init,'window-apply':window_apply,
+          'window-recover':window_recover}
 
 def main(argv=None):
     argv=list(sys.argv[1:] if argv is None else argv)

@@ -43,7 +43,8 @@ def save(path,report):
     finally:
         if temp and os.path.exists(temp):os.unlink(temp)
 
-def _jsonl_line(obj):
+def jsonl_line(obj):
+    """One deterministic JSONL row: sorted keys, compact, non-finite refused, one LF."""
     return json.dumps(obj,sort_keys=True,ensure_ascii=False,allow_nan=False,separators=(',',':'))+'\n'
 
 @contextmanager
@@ -62,7 +63,7 @@ def jsonl_sink(path):
                                        dir=dest.parent,delete=False)
     temp=handle.name
     try:
-        def emit(obj):handle.write(_jsonl_line(obj))
+        def emit(obj):handle.write(jsonl_line(obj))
         yield emit
         handle.flush();os.fsync(handle.fileno());handle.close()
         os.replace(temp,dest)
